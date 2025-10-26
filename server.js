@@ -208,7 +208,7 @@ app.post('/api/login', (req, res) => {
             }
 
             const token = jwt.sign(
-                { id: user.id, username: user.username, role: user.role },
+                { id: user.id, username: user.username, role: user.role, subscription: user.subscription_status },
                 JWT_SECRET,
                 { expiresIn: '7d' }
             );
