@@ -71,6 +71,25 @@ function initializeDatabase() {
         )
     `);
 
+    // Payments/Subscriptions table
+    db.run(`
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            amount DECIMAL(10,2) NOT NULL,
+            plan TEXT NOT NULL,
+            payment_method TEXT,
+            payment_status TEXT DEFAULT 'completed',
+            transaction_id TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    `, (err) => {
+        if (!err) {
+            console.log('✓ Payments table ready');
+        }
+    });
+
     // Create default admin user (password: admin123)
     db.get('SELECT * FROM users WHERE username = ?', ['admin'], (err, user) => {
         if (!user) {
@@ -274,11 +293,26 @@ app.get('/api/playlists', authenticateToken, (req, res) => {
 
         console.log(`📊 Found ${playlists.length} total playlists in database`);
 
-        // Filter playlists based on user subscription
+        // Filter playlists based on user subscription (3-tier system)
         const userSubscription = req.user.subscription || 'free';
         const filteredPlaylists = playlists.filter(p => {
-            if (p.subscription_required === 'free') return true;
-            if (userSubscription === 'premium') return true;
+            const required = p.subscription_required || 'free';
+            
+            // Free plan: Only free content
+            if (userSubscription === 'free') {
+                return required === 'free';
+            }
+            
+            // Lite plan: Free + Lite content
+            if (userSubscription === 'lite') {
+                return required === 'free' || required === 'lite';
+            }
+            
+            // Premium plan: Everything
+            if (userSubscription === 'premium') {
+                return true;
+            }
+            
             return false;
         });
 
@@ -296,9 +330,24 @@ app.get('/api/playlists/:id', authenticateToken, async (req, res) => {
             return res.status(404).json({ error: 'Playlist not found.' });
         }
 
-        // Check subscription access
-        if (playlist.subscription_required === 'premium' && req.user.subscription !== 'premium') {
-            return res.status(403).json({ error: 'Premium subscription required.' });
+        // Check subscription access (3-tier system)
+        const required = playlist.subscription_required || 'free';
+        const userSub = req.user.subscription || 'free';
+        
+        // Check if user has access
+        let hasAccess = false;
+        if (required === 'free') {
+            hasAccess = true; // Everyone can access free content
+        } else if (required === 'lite') {
+            hasAccess = userSub === 'lite' || userSub === 'premium';
+        } else if (required === 'premium') {
+            hasAccess = userSub === 'premium';
+        }
+        
+        if (!hasAccess) {
+            return res.status(403).json({ 
+                error: `${required.charAt(0).toUpperCase() + required.slice(1)} subscription required to access this playlist.` 
+            });
         }
 
         try {
@@ -481,6 +530,253 @@ app.post('/api/favorites', authenticateToken, (req, res) => {
         }
     );
 });
+
+// ========================================
+// SUBSCRIPTION & PAYMENT ENDPOINTS
+// ========================================
+
+// SUBSCRIPTION PLANS CONFIGURATION
+const SUBSCRIPTION_PLANS = {
+    free: {
+        name: 'Free',
+        price: 0,
+        duration: null,
+        features: [
+            'Access to Free playlists only',
+            'Standard streaming quality',
+            'Limited channels',
+            'Ads supported'
+        ]
+    },
+    lite: {
+        name: 'Lite',
+        price: 2.50,
+        duration: 30,
+        features: [
+            'Access to Free + Lite playlists',
+            'HD streaming quality',
+            'More channels',
+            'No ads',
+            'Email support'
+        ]
+    },
+    premium: {
+        name: 'Premium',
+        price: 5.00,
+        duration: 30,
+        features: [
+            'Access to ALL playlists',
+            '4K streaming quality',
+            'All channels',
+            'No ads',
+            'Priority support',
+            'Multi-device access'
+        ]
+    }
+};
+
+// GET /api/plans - Get all subscription plans
+app.get('/api/plans', (req, res) => {
+    res.json(SUBSCRIPTION_PLANS);
+});
+
+// GET /api/me/subscription - Get current user's subscription details
+app.get('/api/me/subscription', authenticateToken, (req, res) => {
+    db.get(`
+        SELECT 
+            subscription_status,
+            subscription_expires,
+            created_at
+        FROM users 
+        WHERE id = ?
+    `, [req.user.id], (err, subscription) => {
+        if (err) {
+            return res.status(500).json({ error: 'Failed to get subscription details.' });
+        }
+
+        const plan = SUBSCRIPTION_PLANS[subscription.subscription_status] || SUBSCRIPTION_PLANS.free;
+        
+        res.json({
+            current_plan: subscription.subscription_status,
+            plan_details: plan,
+            expires: subscription.subscription_expires,
+            is_active: subscription.subscription_status === 'free' || 
+                      (subscription.subscription_expires && new Date(subscription.subscription_expires) > new Date())
+        });
+    });
+});
+
+// POST /api/subscribe - Subscribe to a plan
+app.post('/api/subscribe', authenticateToken, async (req, res) => {
+    const { plan, payment_method } = req.body;
+
+    if (!['lite', 'premium'].includes(plan)) {
+        return res.status(400).json({ error: 'Invalid plan. Choose "lite" or "premium".' });
+    }
+
+    const planDetails = SUBSCRIPTION_PLANS[plan];
+    const now = new Date();
+    const expiryDate = new Date(now);
+    expiryDate.setDate(expiryDate.getDate() + planDetails.duration);
+
+    try {
+        const transactionId = `TXN_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+        // Record payment
+        db.run(`
+            INSERT INTO payments (user_id, amount, plan, payment_method, payment_status, transaction_id)
+            VALUES (?, ?, ?, ?, 'completed', ?)
+        `, [req.user.id, planDetails.price, plan, payment_method || 'card', transactionId], (err) => {
+            if (err) {
+                console.error('Payment recording error:', err);
+                return res.status(500).json({ error: 'Failed to record payment.' });
+            }
+
+            // Update user subscription
+            db.run(`
+                UPDATE users 
+                SET subscription_status = ?,
+                    subscription_expires = ?
+                WHERE id = ?
+            `, [plan, expiryDate.toISOString(), req.user.id], (err) => {
+                if (err) {
+                    console.error('Subscription update error:', err);
+                    return res.status(500).json({ error: 'Failed to update subscription.' });
+                }
+
+                res.json({
+                    message: `Successfully subscribed to ${planDetails.name} plan!`,
+                    subscription: {
+                        plan: plan,
+                        price: planDetails.price,
+                        expires: expiryDate.toISOString(),
+                        transaction_id: transactionId
+                    }
+                });
+            });
+        });
+
+    } catch (error) {
+        console.error('Subscription error:', error);
+        res.status(500).json({ error: 'Failed to process subscription.' });
+    }
+});
+
+// POST /api/cancel-subscription - Cancel subscription
+app.post('/api/cancel-subscription', authenticateToken, (req, res) => {
+    db.run(`
+        UPDATE users 
+        SET subscription_status = 'free',
+            subscription_expires = NULL
+        WHERE id = ?
+    `, [req.user.id], (err) => {
+        if (err) {
+            return res.status(500).json({ error: 'Failed to cancel subscription.' });
+        }
+
+        res.json({ message: 'Subscription cancelled. You have been downgraded to Free plan.' });
+    });
+});
+
+// GET /api/me/payments - Get user's payment history
+app.get('/api/me/payments', authenticateToken, (req, res) => {
+    db.all(`
+        SELECT id, amount, plan, payment_method, payment_status, transaction_id, created_at
+        FROM payments
+        WHERE user_id = ?
+        ORDER BY created_at DESC
+        LIMIT 50
+    `, [req.user.id], (err, payments) => {
+        if (err) {
+            return res.status(500).json({ error: 'Failed to get payment history.' });
+        }
+
+        res.json(payments);
+    });
+});
+
+// ADMIN: GET /api/admin/subscriptions - Get subscription statistics
+app.get('/api/admin/subscriptions', authenticateToken, (req, res) => {
+    if (req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Admin access required.' });
+    }
+
+    db.all(`
+        SELECT 
+            subscription_status as plan,
+            COUNT(*) as count
+        FROM users
+        WHERE role != 'admin'
+        GROUP BY subscription_status
+    `, [], (err, stats) => {
+        if (err) {
+            return res.status(500).json({ error: 'Failed to get subscription stats.' });
+        }
+
+        db.get(`
+            SELECT 
+                SUM(amount) as total_revenue,
+                COUNT(*) as total_transactions,
+                AVG(amount) as avg_transaction
+            FROM payments
+            WHERE payment_status = 'completed'
+        `, [], (err, revenue) => {
+            if (err) {
+                return res.status(500).json({ error: 'Failed to get revenue stats.' });
+            }
+
+            res.json({
+                subscriptions: stats,
+                revenue: revenue || { total_revenue: 0, total_transactions: 0, avg_transaction: 0 }
+            });
+        });
+    });
+});
+
+// ADMIN: GET /api/admin/payments - Get all payments
+app.get('/api/admin/payments', authenticateToken, (req, res) => {
+    if (req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Admin access required.' });
+    }
+
+    db.all(`
+        SELECT 
+            p.id,
+            p.amount,
+            p.plan,
+            p.payment_method,
+            p.payment_status,
+            p.transaction_id,
+            p.created_at,
+            u.username,
+            u.email
+        FROM payments p
+        JOIN users u ON p.user_id = u.id
+        ORDER BY p.created_at DESC
+        LIMIT 100
+    `, [], (err, payments) => {
+        if (err) {
+            return res.status(500).json({ error: 'Failed to get payments.' });
+        }
+
+        res.json(payments);
+    });
+});
+
+// Cron job to expire subscriptions (runs every 24 hours)
+setInterval(() => {
+    db.run(`
+        UPDATE users 
+        SET subscription_status = 'free'
+        WHERE subscription_status != 'free' 
+        AND subscription_expires < datetime('now')
+        AND role != 'admin'
+    `, (err) => {
+        if (!err) {
+            console.log('✓ Checked and expired old subscriptions');
+        }
+    });
+}, 24 * 60 * 60 * 1000);
 
 // Start server
 app.listen(PORT, () => {
