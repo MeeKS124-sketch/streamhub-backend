@@ -70,13 +70,21 @@ function initializeDatabase() {
     `);
 
     // Create default admin user (password: admin123)
-    const adminPassword = bcrypt.hashSync('admin123', 10);
-    db.run(`
-        INSERT OR IGNORE INTO users (username, email, password, role, subscription_status)
-        VALUES ('admin', 'admin@streamhub.com', ?, 'admin', 'premium')
-    `, [adminPassword], (err) => {
-        if (!err) {
-            console.log('✓ Default admin created (username: admin, password: admin123)');
+    db.get('SELECT * FROM users WHERE username = ?', ['admin'], (err, user) => {
+        if (!user) {
+            const adminPassword = bcrypt.hashSync('admin123', 10);
+            db.run(`
+                INSERT INTO users (username, email, password, role, subscription_status)
+                VALUES ('admin', 'admin@streamhub.com', ?, 'admin', 'premium')
+            `, [adminPassword], (err) => {
+                if (!err) {
+                    console.log('✓ Default admin created (username: admin, password: admin123)');
+                } else {
+                    console.error('Error creating admin:', err);
+                }
+            });
+        } else {
+            console.log('✓ Admin user already exists');
         }
     });
 }
