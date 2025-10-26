@@ -5,6 +5,8 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const path = require('path');
+const https = require('https');
+const http = require('http');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -225,20 +227,25 @@ app.get('/api/me', authenticateToken, (req, res) => {
 
 // Get all playlists (filtered by subscription)
 app.get('/api/playlists', authenticateToken, (req, res) => {
-    const userSubscription = req.user.subscription || 'free';
+    console.log(`📋 User ${req.user.username} requesting playlists (subscription: ${req.user.subscription || 'free'})`);
     
     db.all('SELECT * FROM playlists ORDER BY created_at DESC', [], (err, playlists) => {
         if (err) {
+            console.error('❌ Error fetching playlists:', err);
             return res.status(500).json({ error: 'Failed to fetch playlists.' });
         }
 
+        console.log(`📊 Found ${playlists.length} total playlists in database`);
+
         // Filter playlists based on user subscription
+        const userSubscription = req.user.subscription || 'free';
         const filteredPlaylists = playlists.filter(p => {
             if (p.subscription_required === 'free') return true;
             if (userSubscription === 'premium') return true;
             return false;
         });
 
+        console.log(`✅ Returning ${filteredPlaylists.length} playlists to user`);
         res.json(filteredPlaylists);
     });
 });
@@ -258,15 +265,30 @@ app.get('/api/playlists/:id', authenticateToken, async (req, res) => {
         }
 
         try {
-            // Fetch M3U content from URL
-            const response = await fetch(playlist.url);
-            const content = await response.text();
+            // Fetch M3U content from URL using native http/https
+            const url = new URL(playlist.url);
+            const protocol = url.protocol === 'https:' ? https : http;
 
-            res.json({
-                ...playlist,
-                content: content
+            protocol.get(playlist.url, (response) => {
+                let data = '';
+
+                response.on('data', (chunk) => {
+                    data += chunk;
+                });
+
+                response.on('end', () => {
+                    res.json({
+                        ...playlist,
+                        content: data
+                    });
+                });
+            }).on('error', (error) => {
+                console.error('Error fetching playlist:', error);
+                res.status(500).json({ error: 'Failed to fetch playlist content.' });
             });
+
         } catch (error) {
+            console.error('Error:', error);
             res.status(500).json({ error: 'Failed to fetch playlist content.' });
         }
     });
